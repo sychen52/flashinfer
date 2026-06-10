@@ -346,6 +346,12 @@ struct TllmGenFmhaRunnerParams {
   // [numHeadsKv, batchSize, maxNumPagesPerSeqKv] (shared paged-KV index layout), where the
   // selected sparse pages are packed densely at the front of each row.
   bool mUseBlockSparseAttention;
+  // Whether the paged KV cache uses the mixed NoPE-FP4/RoPE-FP8 MLA record: the per-token K
+  // record is the packed-FP4 NoPE latent (mHeadDimV dims, 2 elts per byte) immediately followed
+  // by the E4m3 RoPE tail (mHeadDimQk - mHeadDimV bytes), and the NVFP4 scale factors cover only
+  // the NoPE dims (mHeadDimV / 16 E4m3 values per token, linear layout).
+  // Zero-initialized to false by the constructor's memset.
+  bool mUsesFp8RopeKv;
   // The cuda stream.
   cudaStream_t stream;
   // Whether to enable PDL (Programmatic Dependent Launch).

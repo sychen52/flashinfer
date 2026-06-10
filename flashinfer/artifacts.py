@@ -135,6 +135,11 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
+    # TODO(nvfp4-mla): TRTLLM_GEN_FMHA (path below and CheckSumHash.TRTLLM_GEN_FMHA) must be
+    # updated after the trtllm-gen cubins are restaged with the NVFP4-KV MLA generation kernels
+    # (mixed NoPE-FP4/RoPE-FP8 KV layout, SwapsMmaAb + reuseSmemKForV). The kernel selection in
+    # include/flashinfer/trtllm/fmha/fmhaKernels.cuh requests those kernels for E2m1 MLA decode
+    # and will fail the isSupported check until the restaged artifacts are published.
     TRTLLM_GEN_FMHA: str = "158f6fa11ef139a098cfddcdddce73ca99d164ad/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
         "5988e15c0e6d006c6a64c0f6c6748b4d3150c1af/batched_gemm-3d40263-3e19f0a/"
@@ -164,8 +169,11 @@ class CheckSumHash:
     When updating the ArtifactPath for backend directories, update the corresponding hash.
     """
 
+    # Local restage 2026-07-04: W4A8 MLA family (mixed NoPE-FP4/RoPE-FP8 page-segmented
+    # layout, QMUL4-SASS-patched) re-exported with both E4m3 and Bfloat16 output variants
+    # (sm100a + sm103a); manifest regenerated over the local cubin cache.
     TRTLLM_GEN_FMHA: str = (
-        "c2d9399b2537be785882354a4f9902ed6c03136c0ea341e201eac40c3923e1dc"
+        "8391f813c766b938c1c00c4f608ae04f5b1d274a2222ed18d41f5441fe17275a"
     )
     TRTLLM_GEN_BMM: str = (
         "b19ed6c8b1d3fc13ced823bd65ee764d35a19080aea97e742c82ee73ce4c19b0"

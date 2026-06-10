@@ -189,6 +189,12 @@ void trtllm_paged_attention_launcher(
   runner_params.mMaxSeqLenQ = max_q_len;
   runner_params.mSumOfSeqLensQ = sum_seq_q;
   runner_params.mUsesSharedPagedKvIdx = uses_shared_paged_kv_idx;
+  // Mixed NoPE-FP4/RoPE-FP8 MLA KV record (per-token: packed FP4 NoPE latent + E4m3 RoPE tail,
+  // NVFP4 SFs covering only the NoPE dims). Derived, mirroring trtllm-gen: only the MLA
+  // generation shape (headDimQk > headDimV) ships E2m1 KV with a RoPE tail; sparse MLA and
+  // MHA E2m1 kernels all have headDimQk == headDimV.
+  runner_params.mUsesFp8RopeKv =
+      kv_data_type == Data_type::DATA_TYPE_E2M1 && head_dim_qk > head_dim_vo;
   runner_params.ptrAttentionSinks = attention_sinks;
   runner_params.enable_pdl = enable_pdl;
 
@@ -356,10 +362,20 @@ void trtllm_paged_attention_decode(
   int* cum_seq_lens_q_ptr =
       cum_seq_lens_q.has_value() ? static_cast<int*>(cum_seq_lens_q.value().data_ptr()) : nullptr;
   // Multiply by two for FP4 tensor as it is stored as UINT8 dtype. Assume the dim is even.
-  int head_dim_k = is_4bit(kv_data_type) ? key_cache.size(-1) * 2 : key_cache.size(-1);
   int head_dim_q = is_4bit(q_data_type) ? query.size(-1) * 2 : query.size(-1);
-  int head_dim_v = is_4bit(kv_data_type) ? value_cache.size(-1) * 2 : value_cache.size(-1);
+  // Mixed NoPE-FP4/RoPE-FP8 MLA KV record: the per-token K record is the packed FP4 NoPE latent
+  // ((head_dim_q - 64) / 2 bytes) followed by the 64-dim E4m3 RoPE tail (64 bytes). In that case
+  // key_cache's last dim holds record bytes, not packed FP4 element pairs, so the logical K head
+  // dim equals the query head dim and the logical V head dim equals the output head dim.
+  bool const uses_fp8_rope_kv =
+      is_4bit(kv_data_type) && head_dim_q > 64 && key_cache.size(-1) == (head_dim_q - 64) / 2 + 64;
+  int head_dim_k = uses_fp8_rope_kv
+                       ? head_dim_q
+                       : (is_4bit(kv_data_type) ? key_cache.size(-1) * 2 : key_cache.size(-1));
   int head_dim_o = is_4bit(o_data_type) ? out.size(-1) * 2 : out.size(-1);
+  int head_dim_v = uses_fp8_rope_kv
+                       ? head_dim_o
+                       : (is_4bit(kv_data_type) ? value_cache.size(-1) * 2 : value_cache.size(-1));
   TVM_FFI_ICHECK_EQ(head_dim_k, head_dim_q)
       << "head_dim_k and head_dim_q must be the same, got " << std::to_string(head_dim_k) << " and "
       << std::to_string(head_dim_q);
@@ -368,10 +384,21 @@ void trtllm_paged_attention_decode(
       << "head_dim_v and head_dim_o must be the same for non-MLA attention, or equal to (576, 512) "
          "or (320, 256) for MLA attention, got "
       << std::to_string(head_dim_v) << " and " << std::to_string(head_dim_o);
+  if (uses_fp8_rope_kv) {
+    // Only the DeepSeek MLA generation shape is exported for the mixed layout.
+    TVM_FFI_ICHECK(head_dim_q == 576 && head_dim_o == 512)
+        << "The mixed NoPE-FP4/RoPE-FP8 KV layout requires MLA head dims (576, 512), got "
+        << std::to_string(head_dim_q) << " and " << std::to_string(head_dim_o);
+  }
   int max_num_blocks_per_seq = block_tables.size(-1);
   bool is_shared_kv = key_cache.data_ptr() == value_cache.data_ptr();
   int num_pages_in_mem_pool = is_shared_kv ? key_cache.size(0) : key_cache.size(0) * 2;
   bool is_fp4_kv = is_4bit(kv_data_type);
+  // Strides are passed in FP4-element units (bytes * 2) for FP4 KV caches; kernelParams.h
+  // divides them back by 2 to get descriptor (byte) units. This also holds for the mixed
+  // NoPE-FP4/RoPE-FP8 record whose key_cache strides are byte strides (320B per token): the K
+  // descriptor extent is likewise expressed in FP4-element units
+  // (headDimV + 2 * (headDimQk - headDimV) = 640), so keep the factor of 2.
   int stride_idx_factor = is_fp4_kv ? 2 : 1;
 
   // FlashInfer/vLLM layout -> true; TRT-LLM layout -> false.

@@ -431,6 +431,13 @@ struct KernelParams {
     // Note that for FP4 KV input, elements are stored as uint8_t, each packs 2 FP4 elements.
     // The column index and strides needs to divide by 2.
     auto const colIdxDivisor = dtypeKv == DATA_TYPE_E2M1 ? 2 : 1;
+    // Mixed NoPE-FP4/RoPE-FP8 layout: headDim here is NOT a dim count. It is the per-token K
+    // record size expressed in packed FP4-element units (each 1-byte E4m3 RoPE dim counts as
+    // colIdxDivisor units), so that headDim / colIdxDivisor below equals the record bytes
+    // (640 units -> 320B for 576/512) and head-dim stage offsets land on the RoPE region.
+    if (options.mUsesFp8RopeKv && isK) {
+      headDim = options.mHeadDimV + colIdxDivisor * (options.mHeadDimQk - options.mHeadDimV);
+    }
     auto shape = std::vector<uint64_t>{
         (storeTransformedKvInTmem ? headDim : static_cast<uint64_t>(headDim / colIdxDivisor)) *
             reshapeFactor,
@@ -496,13 +503,20 @@ struct KernelParams {
     // Note that it only works for pagedKv layout.
     FLASHINFER_CHECK(isPagedKv(options.mQkvLayout), "The qkvLayout is not supported.");
 
-    auto shape = std::vector<uint64_t>{
-        static_cast<uint64_t>(headDim / NumEltsPerSf * reshapeFactor),
-        static_cast<uint64_t>(numKeys / reshapeFactor), static_cast<uint64_t>(options.mNumHeadsKv),
-        static_cast<uint64_t>(batchSize)};
-    auto stride = std::vector<uint64_t>{
-        1, static_cast<uint64_t>(headDim / NumEltsPerSf * reshapeFactor),
-        static_cast<uint64_t>(sfStrideHeads), static_cast<uint64_t>(sfStrideBatch)};
+    // The number of SF columns per token. With the mixed NoPE-FP4/RoPE-FP8 layout only the NoPE
+    // latent (mHeadDimV dims) is FP4-quantized, so the per-token SF record covers just those dims
+    // (e.g. 32 instead of 36 for the 576/512 MLA head dims). The head/batch strides still come
+    // from the runner's SF stride fields (read from the scale tensor).
+    int32_t const sfColsPerToken =
+        (options.mUsesFp8RopeKv ? options.mHeadDimV : headDim) / NumEltsPerSf;
+
+    auto shape = std::vector<uint64_t>{static_cast<uint64_t>(sfColsPerToken * reshapeFactor),
+                                       static_cast<uint64_t>(numKeys / reshapeFactor),
+                                       static_cast<uint64_t>(options.mNumHeadsKv),
+                                       static_cast<uint64_t>(batchSize)};
+    auto stride = std::vector<uint64_t>{1, static_cast<uint64_t>(sfColsPerToken * reshapeFactor),
+                                        static_cast<uint64_t>(sfStrideHeads),
+                                        static_cast<uint64_t>(sfStrideBatch)};
 
     return std::make_tuple(shape, stride);
   }
@@ -698,9 +712,13 @@ struct KernelParams {
     // Whether store transformed K/V in TMEM.
     bool const isSwapsMmaAb =
         isSwapsMmaAbForGenerationKernel(static_cast<FmhaKernelType>(kernelMeta.mKernelType));
-    bool const storeTransformedKvInTmem{kernelMeta.mDataTypeKv == DATA_TYPE_E2M1 &&
-                                        kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 &&
-                                        maxHeadDimKv >= 128 && isSwapsMmaAb};
+    // Note: the MLA shared-KV-reuse kernels (mReuseSmemKForV) transform the FP4 KV in SMEM
+    // instead (SmemTransformedKv reads packed FP4 linearly), so they need the packed, unswizzled
+    // UINT8 TMA load rather than the 16U4_ALIGN16B unpack load. This mirrors trtllm-gen's
+    // mStoreTransformedKvInTmem derivation (!mReuseSmemKForV).
+    bool const storeTransformedKvInTmem{
+        kernelMeta.mDataTypeKv == DATA_TYPE_E2M1 && kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 &&
+        maxHeadDimKv >= 128 && isSwapsMmaAb && !kernelMeta.mReuseSmemKForV};
     // Whether swizzle is needed for K/V.
     bool const swizzleKv{storeTransformedKvInTmem || !transformsKv};
     // Whether we can reshape the TMA box for K/V to widen it to 128B.
@@ -779,9 +797,19 @@ struct KernelParams {
     if (kernelMeta.mDataTypeKv == DATA_TYPE_E2M1) {
       // The number of elements per SF.
       int32_t NumEltsPerSf = 16;
+      // The number of SF columns per token. With the mixed NoPE-FP4/RoPE-FP8 layout only the
+      // NoPE latent (mHeadDimV dims) has SFs (must match makeTmaShapeStrideKvSf).
+      int32_t const sfColsPerToken =
+          (options.mUsesFp8RopeKv ? options.mHeadDimV : maxHeadDimKv) / NumEltsPerSf;
       // The reshape factor for K/V SF: aim for box width 128B, limit to numKeysPerTile.
-      int32_t const reshapeFactorKvSf =
-          std::min(128 / (maxHeadDimKv / NumEltsPerSf), numKeysPerTile);
+      // TMA requires the 1-byte SF box inner dimension to be a multiple of 16 bytes. For
+      // maxHeadDimKv=576 there are 36 SF cols, so r=3 would produce a 108B box; round up to
+      // the next aligned factor, e.g. r=4 -> 144B.
+      int32_t reshapeFactorKvSf = std::max(1, 128 / sfColsPerToken);
+      reshapeFactorKvSf = std::min(reshapeFactorKvSf, numKeysPerTile);
+      while (reshapeFactorKvSf < numKeysPerTile && (sfColsPerToken * reshapeFactorKvSf) % 16 != 0) {
+        ++reshapeFactorKvSf;
+      }
       // Compute the shape and stride for SF tensor.
       // FIXME: assume K and V uses the same shape.
       auto [shapeKvSf, strideKvSf] =
@@ -789,7 +817,7 @@ struct KernelParams {
 
       // The tileShapes for K/V.
       std::vector<uint32_t> tileShapeKvSf(shapeKvSf.size(), 1);
-      tileShapeKvSf[0] = maxHeadDimKv / NumEltsPerSf * reshapeFactorKvSf;
+      tileShapeKvSf[0] = sfColsPerToken * reshapeFactorKvSf;
       tileShapeKvSf[1] = numKeysPerTile / reshapeFactorKvSf;
 
       // The tile box is reshaped from (headDim / NumEltsPerSf, tileSizeKv) into
