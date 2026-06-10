@@ -172,7 +172,16 @@ def _check_trtllm_gen_mla_shape(
     num_seqs, num_tokens, _, qk_head_dim = query.shape
     ckv_dim = kv_cache.shape[3]
     expected_qk_head_dim = kv_lora_rank + qk_rope_head_dim
-    if qk_head_dim != expected_qk_head_dim or ckv_dim != expected_qk_head_dim:
+    # Page-segmented NVFP4 MLA pool ("Option B"): a uint8 pool whose nominal last dim is the
+    # per-token byte budget of one page record. Each page stores page_size data records of
+    # (kv_lora_rank // 2) packed-FP4 NoPE bytes + qk_rope_head_dim E4m3 RoPE bytes, followed by
+    # page_size scale records of (kv_lora_rank // 16) E4m3 scale factors. For DeepSeek
+    # (kv_lora_rank=512, qk_rope_head_dim=64) that is 320 + 32 = 352.
+    nvfp4_pool_dim = kv_lora_rank // 2 + qk_rope_head_dim + kv_lora_rank // 16
+    is_nvfp4_kv_pool = kv_cache.dtype == torch.uint8 and ckv_dim == nvfp4_pool_dim
+    if qk_head_dim != expected_qk_head_dim or (
+        ckv_dim != expected_qk_head_dim and not is_nvfp4_kv_pool
+    ):
         raise ValueError(
             f"Expected head dim {expected_qk_head_dim} for query and kv_cache, got {qk_head_dim} and {ckv_dim}"
         )
@@ -1443,12 +1452,50 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
         # that autotune profile-loop invocations are also protected.
         # The 8 MB memset is ~5us on B200, negligible vs kernel time.
         self.workspace_buffer[:_TRTLLM_GEN_MLA_COUNTER_REGION_BYTES].zero_()
+
+        kv_cache = self.kv_cache
+        key_block_scales = None
+        value_block_scales = None
+        # Page-segmented NVFP4 MLA pool ("Option B"): uint8 pages laid out as
+        #   [page_size x (kv_lora_rank // 2 packed-FP4 NoPE bytes + qk_rope_head_dim E4m3
+        #    RoPE bytes)] followed by
+        #   [page_size x (kv_lora_rank // 16 E4m3 scale factors, linear layout)].
+        # The nominal last dim (data_dim + scale_dim bytes) is only a byte budget; carve
+        # zero-copy strided views for the data and scale segments and hand them to the kernel
+        # as separate tensors (the TMA descriptors are built from their strides).
+        data_dim = self.kv_lora_rank // 2 + self.qk_rope_head_dim
+        scale_dim = self.kv_lora_rank // 16
+        if kv_cache.dtype == torch.uint8 and kv_cache.shape[-1] == data_dim + scale_dim:
+            num_pages = kv_cache.shape[0]
+            page_size = kv_cache.shape[-2]
+            page_stride = page_size * (data_dim + scale_dim)  # bytes per page
+            base_offset = kv_cache.storage_offset()
+            # Data view: [num_pages, 1, page_size, data_dim], token records are contiguous
+            # (data_dim bytes apart) at the start of each page.
+            data_view = torch.as_strided(
+                kv_cache,
+                (num_pages, 1, page_size, data_dim),
+                (page_stride, page_stride, data_dim, 1),
+                storage_offset=base_offset,
+            )
+            # Scale view: [num_pages, 1, page_size, scale_dim], token records are contiguous
+            # (scale_dim bytes apart) right after the page's data block.
+            scale_view = torch.as_strided(
+                kv_cache,
+                (num_pages, 1, page_size, scale_dim),
+                (page_stride, page_stride, scale_dim, 1),
+                storage_offset=base_offset + page_size * data_dim,
+            ).view(torch.float8_e4m3fn)
+            kv_cache = data_view
+            key_block_scales = scale_view
+            value_block_scales = scale_view
+
         self._run(
             out,
             None,  # fp4 output (unsupported by wrapper)
             query_flat,
-            self.kv_cache,
-            self.kv_cache,  # kv passed twice (K/V views over the same buffer)
+            kv_cache,
+            kv_cache,  # kv passed twice (K/V views over the same buffer)
             self.workspace_buffer,
             block_tables,
             seq_lens,
@@ -1467,8 +1514,8 @@ class TrtllmGenMlaDecodeRunner(TunableRunner):
             self.workspace_buffer.numel() * self.workspace_buffer.element_size(),
             self.sinks,
             None,  # cum_seq_lens_q
-            None,  # key_block_scales
-            None,  # value_block_scales
+            key_block_scales,
+            value_block_scales,
             self.skip_softmax_threshold_scale_factor,
             self.uses_shared_paged_kv_idx,
             lse,
@@ -1861,10 +1908,14 @@ def trtllm_batch_decode_with_kv_cache_mla(
         check_shape_dtype_device(
             out,
             expected_out_shape,
-            torch.bfloat16,
+            None,
             query.device,
             "out",
         )
+        if out.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+            raise TypeError(
+                f"out must have dtype torch.bfloat16 or torch.float8_e4m3fn, got {out.dtype}"
+            )
 
     # Remember the caller-supplied lse so we can return it in its original
     # shape: 2D ``(B*q_len, H)`` stays 2D, 3D ``(B, q_len, H)`` stays 3D, and
@@ -1911,6 +1962,12 @@ def trtllm_batch_decode_with_kv_cache_mla(
         return_lse,
         lse,
     )
+    # The page-segmented NVFP4 pool (uint8) is a trtllm-gen-only layout.
+    if cute_dsl_reason is None and kv_cache.dtype == torch.uint8:
+        cute_dsl_reason = (
+            "cute-dsl backend (MLA decode kernel) does not support the NVFP4 "
+            "(uint8) kv_cache layout"
+        )
     if backend == "cute-dsl":
         if cute_dsl_reason is not None:
             raise ValueError(cute_dsl_reason)

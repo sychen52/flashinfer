@@ -509,7 +509,10 @@ class TllmGenFmhaKernel {
         selectKernelParams.mSelectNewKernel = true;
       } else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params) &&
                  !isSparseMla(params.mSparseMlaType) && selectKernelParams.mTileSizeKv == 128 &&
-                 getEnvUseTileSizeKv64ForTrtllmGen()) {
+                 // The NVFP4-KV MLA reuse kernels are exported with tileSizeKv = 128 only, and
+                 // selectMlaGenerationKernel re-forces 128 on re-selection, so the downgrade
+                 // would never converge for them.
+                 !selectKernelParams.mReuseSmemKForV && getEnvUseTileSizeKv64ForTrtllmGen()) {
         // Use smaller tileSizeKv to fully utilize the SMs.
         selectKernelParams.mTileSizeKv = 64;
         // Need to select a different kernel.
@@ -686,6 +689,18 @@ class TllmGenFmhaKernel {
 
     if (isSparseMla(params.mSparseMlaType)) {
       selectSparseMlaGenerationKernel(params, selectKernelParams);
+    } else if (mDtypeK == DATA_TYPE_E2M1) {
+      // NVFP4-KV MLA generation (mixed NoPE-FP4/RoPE-FP8 layout): trtllm-gen exports these only
+      // as SwapsMmaAbForGeneration shared-KV-reuse kernels (the dequantized KV is kept in SMEM
+      // and the K buffer is reused for V), with tileSizeKv = 128 and the full headDimV per CTA
+      // (the headDimPerCtaV-splitting heuristic does not work with reuseSmemKForV; see
+      // computeCtaAndClusterConfig). The reuseSmemKForV flag participates in the kernel hash
+      // (bit 53) via hashFromRunnerParams, matching the exported kernel meta.
+      kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
+      selectKernelParams.mReuseSmemKForV = true;
+      selectKernelParams.mTileSizeKv = 128;
+      selectKernelParams.mHeadDimPerCtaV = params.mHeadDimV;
+      tileSizeQ = params.mNumHeadsQPerKv <= 8 ? 8 : (params.mNumHeadsQPerKv <= 16 ? 16 : 32);
     } else {
       // Non-sparse MLA: use SwapsMmaAb when numHeadsQPerKv <= 32 or seqLenPerCtaKv is small.
       bool const useSwapsMmaAb = params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params);
