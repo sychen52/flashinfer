@@ -173,7 +173,7 @@ class CheckSumHash:
     # layout, QMUL4-SASS-patched) re-exported with both E4m3 and Bfloat16 output variants
     # (sm100a + sm103a); manifest regenerated over the local cubin cache.
     TRTLLM_GEN_FMHA: str = (
-        "8391f813c766b938c1c00c4f608ae04f5b1d274a2222ed18d41f5441fe17275a"
+        "5d50f636888609902c25c68c46d760eb6128ef4ac96bba88ba82453e6e10dea5"
     )
     TRTLLM_GEN_BMM: str = (
         "b19ed6c8b1d3fc13ced823bd65ee764d35a19080aea97e742c82ee73ce4c19b0"
