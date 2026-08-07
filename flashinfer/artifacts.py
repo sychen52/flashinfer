@@ -173,11 +173,17 @@ class CheckSumHash:
     """
 
     # Local single-ABI restage 2026-08-06 (see ArtifactPath.TRTLLM_GEN_FMHA): every family
-    # re-exported from trtllm-gen e6169e8b for sm100a + sm103a; 27500 kernels, all declaring
-    # the 40-field metaInfo struct that matches the 2240-byte parameter block this header
-    # builds. The W4A8 MLA kernels are QMUL4-SASS-patched as before.
+    # re-exported from trtllm-gen e6169e8b for sm100a + sm103a, all declaring the 40-field
+    # metaInfo struct that matches the 2240-byte parameter block this header builds. The
+    # W4A8 MLA kernels are QMUL4-SASS-patched as before.
+    #
+    # 27376 kernels, not the full 27500 the export produced: 124 were duplicates under
+    # hashID(), which ignores groupsHeadsQ and sees maskType=0 for every generation kernel.
+    # loadKernels() rejects same-SM hash conflicts outright, so the export's extra
+    # PagedKvCausal...Grouped variants were dropped in favour of the PagedKvDense ones the
+    # published artifact shipped.
     TRTLLM_GEN_FMHA: str = (
-        "465526b2cf0ca1bd40f6add821f9d53ceeea1ce8749767336d33e396d96f2045"
+        "a376197a2a279716bb7676fd365b2a10aa6d3a0d70f02eacdade1d7260a6b7a6"
     )
     TRTLLM_GEN_BMM: str = (
         "b19ed6c8b1d3fc13ced823bd65ee764d35a19080aea97e742c82ee73ce4c19b0"
