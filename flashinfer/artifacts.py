@@ -135,12 +135,15 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
-    # TODO(nvfp4-mla): TRTLLM_GEN_FMHA (path below and CheckSumHash.TRTLLM_GEN_FMHA) must be
-    # updated after the trtllm-gen cubins are restaged with the NVFP4-KV MLA generation kernels
-    # (mixed NoPE-FP4/RoPE-FP8 KV layout, SwapsMmaAb + reuseSmemKForV). The kernel selection in
-    # include/flashinfer/trtllm/fmha/fmhaKernels.cuh requests those kernels for E2m1 MLA decode
-    # and will fail the isSupported check until the restaged artifacts are published.
-    TRTLLM_GEN_FMHA: str = "158f6fa11ef139a098cfddcdddce73ca99d164ad/fmha/trtllm-gen/"
+    # LOCAL, not published: a single-ABI FMHA set re-exported from trtllm-gen e6169e8b for
+    # sm100a (B200/GB200) + sm103a (B300/GB300), covering every family including the NVFP4-KV
+    # MLA generation kernels (mixed NoPE-FP4/RoPE-FP8 layout, SwapsMmaAb + reuseSmemKForV).
+    #
+    # It has to be one export: the published artifact's kernels take a 2176-byte parameter
+    # block while trtllm-gen e6169e8b's take 2240, and kernelParams.h can only match one. Mixing
+    # them means whichever generation does not match reads past the buffer supplied to
+    # cuLaunchKernelEx and dies with an illegal memory access after the model has loaded.
+    TRTLLM_GEN_FMHA: str = "w4a8singleabi20260806/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
         "5988e15c0e6d006c6a64c0f6c6748b4d3150c1af/batched_gemm-3d40263-3e19f0a/"
     )
@@ -169,11 +172,12 @@ class CheckSumHash:
     When updating the ArtifactPath for backend directories, update the corresponding hash.
     """
 
-    # Local restage 2026-07-04: W4A8 MLA family (mixed NoPE-FP4/RoPE-FP8 page-segmented
-    # layout, QMUL4-SASS-patched) re-exported with both E4m3 and Bfloat16 output variants
-    # (sm100a + sm103a); manifest regenerated over the local cubin cache.
+    # Local single-ABI restage 2026-08-06 (see ArtifactPath.TRTLLM_GEN_FMHA): every family
+    # re-exported from trtllm-gen e6169e8b for sm100a + sm103a; 27500 kernels, all declaring
+    # the 40-field metaInfo struct that matches the 2240-byte parameter block this header
+    # builds. The W4A8 MLA kernels are QMUL4-SASS-patched as before.
     TRTLLM_GEN_FMHA: str = (
-        "5d50f636888609902c25c68c46d760eb6128ef4ac96bba88ba82453e6e10dea5"
+        "465526b2cf0ca1bd40f6add821f9d53ceeea1ce8749767336d33e396d96f2045"
     )
     TRTLLM_GEN_BMM: str = (
         "b19ed6c8b1d3fc13ced823bd65ee764d35a19080aea97e742c82ee73ce4c19b0"
